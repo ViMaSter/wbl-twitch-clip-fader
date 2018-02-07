@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Twitch clips demo</title>
+    <script src="https://player.twitch.tv/js/embed/v1.js"></script>
+    <style media="screen">
+        video
+        {
+            position: absolute;
+            top: 0px;
+            left: 0px;
+            width: 100vw;
+            height: 100vh;
+        }
+        .invisible
+        {
+            opacity: 0;
+        }
+        .lowPriority
+        {
+            z-index: 500;
+        }
+        .highPriority
+        {
+            opacity: 1;
+            z-index: 1000;
+        }
+    </style>
+    <script type="text/javascript" name="helperMethods">
+    var HelperMethods = (function (){
+        let exports = {};
+
+        /// Convert clip slug (name) to URL
+        ///
+        /// Converts slug passed as `clipSlug` to a URL pointing to the highest quality option of that clip
+        /// Calls `callback` after execution, as the required XMLHttpRequest is asynchronous
+        exports.TwitchClipToMP4 = function(clipSlug, callback)
+        {
+            console.log(`Resolving URL of clip ${clipSlug}`);
+            const conversionRequest = new XMLHttpRequest();
+            conversionRequest.open( "GET", `https://clips.twitch.tv/${clipSlug}`, true );
+            conversionRequest.send( null );
+            conversionRequest.addEventListener("load", function(evt)
+            {
+                var qualityJSONScanner = /quality_options: (.*),/g;
+                var result = qualityJSONScanner.exec(evt.currentTarget.responseText);
+                if (result.length <= 1)
+                {
+                    console.error("Couldn't find a .mp4 for this clip!");
+                    console.error(result);
+                    return;
+                }
+
+                try
+                {
+                    var resultJSON = JSON.parse(result[1]);
+                    if (resultJSON[0] && resultJSON[0].source)
+                    {
+                        callback(clipSlug, resultJSON[0].source);
+                    }
+                    else
+                    {
+                        console.error("Couldn't find JSON to parse!");
+                    }
+                }
+                catch (e)
+                {
+                    console.error("Couldn't parse JSON from clip URL!");
+                    console.error(result);
+                    console.error(resultJSON);
+                    return;
+                }
+            });
+        }
+
+        /// Fades the volume in or out
+        /// Linearly fades the `volume`-property of `element` from 0 to 1 (if `isFadeIn` == true)
+        /// or from 1 to 0 (if `isFadeIn` == false) in `duration` milliseconds
+        exports.AudioFade = function(element, isFadeIn, milliseconds)
+        {
+            element.dataset.startAt = new Date().getTime();
+            var intervalID = setInterval(function() {
+                var now = new Date().getTime();
+                var end = parseInt(element.dataset.startAt) + milliseconds;
+                var delta = (end - now) / milliseconds;
+                if (isFadeIn)
+                {
+                    delta = 1 - delta;
+                }
+                element.volume = delta;
+            }, 60);
+
+            setTimeout(function()
+            {
+                clearInterval(intervalID);
+
+                var delta = isFadeIn ? 1 : 0;
+                element.volume = delta;
+            }, milliseconds);
+        }
+
+        /// Get the parameters following # in the URL as an associative array
+        /// @see https://stackoverflow.com/a/4198132
+        exports.GetHashParams = function()
+        {
+            var hashParams = {};
+            var e,
+                a = /\+/g,  // Regex for replacing addition symbol with a space
+                r = /([^&;=]+)=?([^&;]*)/g,
+                d = function (s) { return decodeURIComponent(s.replace(a, " ")); },
+                q = window.location.hash.substring(1);
+
+            while (e = r.exec(q))
+               hashParams[d(e[1])] = d(e[2]);
+
+            return hashParams;
+        }
+
+        return exports;
+    });
+    </script>
+    <script type="text/javascript">
+    const Helper = HelperMethods();
+    const Config =
+    {
+        // take either what's after # in the url as our twitch channel or default to "wunderbaerlive"
+        TwitchChannel: Helper.GetHashParams()["channel"] || "wunderbaerlive",
+        // required, to not flood the twitch API with only one client
+        TwitchClientID: Helper.GetHashParams()["clientID"],
+        // transition time for audio and video inbetween clips in milliseconds
+        TransitionTimeInMS: 1 * 2000,
+        // amount of players to use as buffers
+        //  raise this, if less stable connection is used
+        //  lower this, if less powerful machine is used
+        // also defines how many videos have to be left in the queue, before requesting new videos
+        PlayerInstancesCount: 5,
+        // amount of clips to request at once
+        //  also defines how many different clips are loaded at max, since this tool
+        //  does not yet auto-seek new clips
+        ClipLimit: 100
+    };
+
+    const LoopingClipPlayer = (function(config)
+    {
+        // A wrapper for a <video>-DOMElement with helper-methods and events
+        class Player
+        {
+            constructor(index, queue)
+            {
+                this.Index = index;
+                this.Queue = queue;
+                this.Element = document.createElement('video');
+                this.Element.style.transition = `all ${Config.TransitionTimeInMS}ms`;
+                this.Element.classList.add("lowPriority");
+                this.Element.classList.add("invisible");
+                this.Element.addEventListener('ended', this.OnPlaybackEnded.bind(this), false);
+                this.Element.autoPlay = false;
+                this.Element.loop = false;
+                document.getElementById("players").appendChild(this.Element);
+            }
+
+            Update()
+            {
+                // Fill player if empty
+                if (this.Element.src == "" && (this.Element.duration <= 0 || isNaN(this.Element.duration)))
+                {
+                    console.log(`Player ${this.Index} is blank!`);
+                    this.LoadNextMedia();
+                }
+
+                // Re-fill if an error occured with the last file
+                if (this.Element.error)
+                {
+                    console.log(`Error trying to play Player ${this.Index}; loading next clip instead; error details: %o`, this.Element.error);
+                    this.LoadNextMedia();
+                }
+
+                // Continue execution only for "active" players
+                if (ActivePlayerIndex != this.Index)
+                {
+                    return;
+                }
+
+                // Fade into new player once enough time has passed
+                if (this.Element.duration - this.Element.currentTime <= Config.TransitionTimeInMS/1000)
+                {
+                    const NextPlayerIndex = (ActivePlayerIndex + 1) % Config.PlayerInstancesCount;
+
+                    console.log(`Player ${this.Index} has less than ${Config.TransitionTimeInMS}s left! Transitioning now!`);
+                    console.log(`Changing player from ${ActivePlayerIndex} to ${NextPlayerIndex}...`);
+
+                    this.Element.classList.toggle("highPriority");
+                    this.Element.classList.toggle("lowPriority");
+
+                    Helper.AudioFade(this.Element, false, Config.TransitionTimeInMS);
+                    Helper.AudioFade(Players[NextPlayerIndex].Element, true, Config.TransitionTimeInMS);
+
+                    ActivePlayerIndex = NextPlayerIndex;
+                }
+
+                // Start player once active and not started
+                if (this.Element.paused)
+                {
+                    console.log(`Playing player ${this.Index}...`);
+                    this.Element.classList.toggle("highPriority");
+                    this.Element.classList.toggle("lowPriority");
+                    this.Element.classList.toggle("invisible");
+                    this.Element.play();
+                }
+            }
+
+            // Grabs the next MP4 and sets it as source for this player
+            LoadNextMedia(callback)
+            {
+                var nextVideo = this.Queue.GetNextVideo();
+                console.log(`Loading video ${nextVideo} into Player ${this.Index}.`);
+                this.Element.src = nextVideo;
+                if (typeof callback == "function")
+                {
+                    callback(this.Index);
+                }
+            }
+
+            // Called once a player ends playback
+            OnPlaybackEnded(event)
+            {
+                event.currentTarget.classList.add("invisible");
+                this.LoadNextMedia();
+            }
+        }
+
+        // Current queue of MP4s
+        class AutoTwitchQueue
+        {
+            constructor(channel, minimumQueueSize)
+            {
+                this.Channel = channel;
+                this.MinimumQueueSize = minimumQueueSize;
+                this.VideoRequestCount = minimumQueueSize;
+
+                this.CurrentNewVideoRequest = null;
+                this.Queue = [];
+            }
+
+            // Take a clip slug and add the conversion to a MP4-URL to the queue
+            AddVideoBySlug(slug)
+            {
+                console.log(`Requesting to add the MP4 for clip ${slug}`);
+                Helper.TwitchClipToMP4(slug, function (slug, clipMP4)
+                {
+                    console.log(`Adding the MP4 for clip ${slug} (${clipMP4})`);
+                    this.Queue.push(clipMP4);
+                }.bind(this));
+                this.PrintCurrentQueue();
+            }
+
+            // Debug helper to print the current queue of videos
+            PrintCurrentQueue()
+            {
+                console.groupCollapsed("Current queue:");
+                for (let index in this.Queue)
+                {
+                    console.log(this.Queue[index])
+                }
+                console.groupEnd();
+            }
+
+            HasVideos()
+            {
+                return this.Queue.length > 0;
+            }
+
+            GetNextVideo()
+            {
+                var nextClip = this.Queue.shift();
+                console.log(`Requesting video, got ${nextClip}!`);
+                this.PrintCurrentQueue();
+                if (this.Queue.length <= this.MinimumQueueSize)
+                {
+                    console.log(`Requesting new videos, as we're running low in our current queue!`);
+                    this.RequestNewVideos();
+                }
+                return nextClip;
+            }
+
+            // Fill the queue with new videos; calls `callback` on completion
+            RequestNewVideos(callback)
+            {
+                if (this.CurrentNewVideoRequest != null)
+                {
+                    console.warn("We're already grabbing new videos; ignorning this request.");
+                    return;
+                }
+
+                const requestURL = `https://api.twitch.tv/kraken/clips/top?channel=${Config.TwitchChannel}&period=all&trending=false&limit=${Config.ClipLimit}`;
+                this.CurrentNewVideoRequest = new XMLHttpRequest();
+                this.CurrentNewVideoRequest.open( "GET", requestURL, true );
+                this.CurrentNewVideoRequest.setRequestHeader("Accept", "application/vnd.twitchtv.v5+json");
+                this.CurrentNewVideoRequest.setRequestHeader("Client-ID", Config.TwitchClientID);
+                this.CurrentNewVideoRequest.onload = function (e) {
+                    if (this.CurrentNewVideoRequest.readyState === 4)
+                    {
+                        if (this.CurrentNewVideoRequest.status === 200)
+                        {
+                            console.log("Parsing request-response:");
+                            var parsedValue = JSON.parse(this.CurrentNewVideoRequest.responseText);
+                            console.log(parsedValue);
+                            for (let index in parsedValue.clips)
+                            {
+                                var clip = parsedValue.clips[index];
+                                this.AddVideoBySlug(clip.slug);
+                            }
+                            if (typeof callback == "function")
+                            {
+                                callback();
+                            }
+                            this.CurrentNewVideoRequest = null;
+                        }
+                        else
+                        {
+                            console.error("Error trying to get clips; retrying");
+                            this.RequestNewVideos();
+                        }
+                    }
+                }.bind(this, callback);
+                this.CurrentNewVideoRequest.send( null );
+            }
+        }
+
+        const Helper = HelperMethods();
+
+        const Config = config;
+
+        // Gets called once all players are initialized and can be filled with media
+        let OnPlayersReady = function(){};
+
+        // Currently active player z-index
+        // Once a transition to another player is STARTED, this is changed to the new index
+        let ActivePlayerIndex = -1;
+        
+        // Contains references to all players
+        let Players = [];
+
+        // Current queue of videos
+        const TwitchQueue = new AutoTwitchQueue(Config.TwitchChannel, Config.PlayerInstancesCount);
+
+        // Called once a player is initialized
+        const OnPlayersInitialized = function()
+        {
+            if (typeof OnPlayersReady == "function")
+            {
+                console.log("All players ready!");
+                OnPlayersReady();
+            }
+        }
+
+        // Initial setup for the amount of players specified
+        const SetupPlayers = function(amountOfPlayers)
+        {
+            for (let i = 0; i < amountOfPlayers; i++)
+            {
+                Players[i] = new Player(i, TwitchQueue);
+            }
+
+            TwitchQueue.RequestNewVideos(function()
+            {
+                ActivePlayerIndex = 0;
+                UpdatePlayerState();
+            });
+        }
+
+        // Update method that calls itself every `animationFrame`
+        // @see https://developer.mozilla.org/en-US/docs/Web/API/window/requestAnimationFrame
+        const UpdatePlayerState = function()
+        {
+            // Once called initially, ensure this method loops every new frame
+            window.requestAnimationFrame(UpdatePlayerState);
+
+            // Skip this frame, if there are no videos present
+            if (!TwitchQueue.HasVideos())
+            {
+                console.warning("No videos present yet but the update loop is already running!")
+                return;
+            }
+
+            for (let i = 0; i < Players.length; i++)
+            {
+                Players[i].Update();
+            }
+        }
+
+        // Current request for new videos; global to stop us from executing the request twice
+        SetupPlayers(Config.PlayerInstancesCount, TwitchQueue);
+        return { "Players": Players };
+    });
+    </script>
+</head>
+<body>
+    <div id="players">
+        <script type="text/javascript">
+        window.addEventListener('load', function()
+        {
+            player = LoopingClipPlayer(Config)
+        }, false );
+        </script>
+    </div>
+</body>
+</html>
